@@ -8,26 +8,27 @@ It implements a supervisor agent that routes queries to a **RAG-based Metadata Q
 
 ## 1. Graph State & Architecture Overview
 
-The system is modeled as a state machine where nodes represent agents or tools, and edges represent conditional transitions.
+The system is modeled as a state machine where the **Supervisor & Condenser** node acts as a unified entry point, routing queries and resolving conversational history in a single step to optimize latency and LLM token usage.
 
 ```mermaid
 flowchart TD
-    Start([User Input]) --> Router{Supervisor / Router}
+    Start([User Input]) --> CacheCheck{Tier 1: Semantic Cache Lookup}
+    CacheCheck -->|Cache Hit similarity > 0.95| OutputNode[Response Formatter]
+    CacheCheck -->|Cache Miss| Router{Supervisor & Condenser}
     
     %% QA Node
     Router -->|Query about schemas/tables| QAAgent[EDW QA Agent]
-    subgraph Q&A Sub-Flow [Dialogue & Exemplar Aware]
-        QAAgent --> CondenseQuery[1. Condense & Rephrase Follow-up]
-        CondenseQuery --> RetrieveQAExemplars[2. Fetch Thumbs-Up Q&A Examples]
-        RetrieveQAExemplars --> MetadataSearch[3. Search Metadata Catalog]
-        MetadataSearch --> GenerateAnswer[4. Generate Contextual Answer]
+    subgraph qa_flow ["Dialogue & Exemplar Aware"]
+        QAAgent --> RetrieveQAExemplars[1. Fetch Thumbs-Up Q&A Examples]
+        RetrieveQAExemplars --> MetadataSearch[2. Search Metadata Catalog]
+        MetadataSearch --> GenerateAnswer[3. Generate Contextual Answer]
     end
-    GenerateAnswer --> OutputNode[Response Formatter]
+    GenerateAnswer --> OutputNode
     
     %% SQL Node (Sub-Graph Bridge)
     Router -->|Query to generate query/KPIs| SQLBridge[SQL Sub-Graph Bridge]
     
-    subgraph SQL Sub-Graph [Schema RAG, Validation & Few-Shot Scope]
+    subgraph sql_flow ["Schema RAG, Validation & Few-Shot Scope"]
         SQLBridge --> SQL_Start([Start Subgraph])
         SQL_Start --> FetchSQLExemplars[1. Retrieve Thumbs-Up SQL Examples]
         FetchSQLExemplars --> IdentifyTables[2. Identify Tables via Vector DB]
@@ -58,6 +59,7 @@ Here is the complete blueprint showing how to organize the State, Nodes, and con
 
 ```python
 from typing import Annotated, Dict, List, Literal, TypedDict
+import json
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
@@ -69,6 +71,8 @@ from langgraph.checkpoint.memory import MemorySaver
 class MainState(TypedDict):
     messages: List[BaseMessage]   # Full conversational dialogue history
     current_agent: str            # Active agent router targets
+    resolved_query: str           # Pre-condensed standalone query (resolved pronouns/context)
+    cache_hit: bool               # True if Tier 1 semantic cache returned a match
     final_sql: str                # Holds the last successfully verified SQL query
     response_text: str            # Final text output to present to the user
 
@@ -76,7 +80,7 @@ class MainState(TypedDict):
 # 2. PRIVATE SUB-GRAPH STATE DEFINITION (SQL Scope)
 # ==========================================
 class SQLPrivateState(TypedDict):
-    chat_history: List[BaseMessage] # Trimmed message history for context
+    chat_history: List[BaseMessage] # Trimmed message history containing the resolved query
     base_sql: str                   # Previous successful SQL (for follow-up edits)
     few_shot_examples: str          # Dynamically retrieved positive SQL exemplars
     target_tables: List[str]        # Dynamically retrieved relevant tables
@@ -258,41 +262,143 @@ sql_sub_graph = sub_workflow.compile()
 
 
 # ==========================================
-# 5. MAIN GRAPH NODES & ROUTER
+# 5. SEMANTIC CACHE LOOKUP (TIER 1 - Before Router)
+# ==========================================
+
+SEMANTIC_CACHE_THRESHOLD = 0.95
+
+def semantic_cache_lookup(state: MainState) -> Dict:
+    """
+    Tier 1 Cache: Performs a vector similarity search against a store of 
+    previously answered questions BEFORE any LLM calls. If a near-exact 
+    match is found (similarity > 0.95), the cached answer is returned 
+    immediately, bypassing the Supervisor, Router, and all agent nodes.
+    This is a database-only operation with zero LLM token cost.
+    """
+    latest_message = state["messages"][-1].content
+    
+    # Production implementation:
+    # results = answer_cache_vector_store.similarity_search_with_score(latest_message, k=1)
+    # if results and results[0][1] >= SEMANTIC_CACHE_THRESHOLD:
+    #     cached_doc = results[0][0]
+    #     return {
+    #         "cache_hit": True,
+    #         "response_text": cached_doc.page_content,
+    #         "resolved_query": latest_message
+    #     }
+    
+    return {"cache_hit": False, "resolved_query": latest_message}
+
+def route_cache_result(state: MainState) -> Literal["supervisor", "formatter"]:
+    """Routes to formatter (skip everything) on cache hit, or to supervisor on miss."""
+    if state.get("cache_hit", False):
+        return "formatter"
+    return "supervisor"
+
+
+# ==========================================
+# 6. MAIN GRAPH NODES & ROUTER
 # ==========================================
 
 def supervisor_router(state: MainState) -> Dict:
     """
-    Evaluates user intent to route them to the correct agent node.
+    Unified Supervisor: Evaluates user intent to route queries AND condenses 
+    follow-up messages into standalone queries in a single LLM invocation.
+    Uses a fast heuristic to skip condensation if there is no chat history.
     """
-    recent_messages = state["messages"][-2:]
+    messages = state["messages"]
+    latest_message = messages[-1].content
     
+    # Heuristic 1: If it's the first message, bypass rephrasing entirely
+    if len(messages) <= 1:
+        # Evaluate intent using a single fast routing classification call
+        route_prompt = f"""
+        Classify the intent of this query for an Enterprise Data Warehouse:
+        - 'metadata_qa': Define concepts, locate tables/columns, explain database relationships or schemas.
+        - 'sql_subgraph': Generate a SQL query, calculate metrics/KPIs, or update a query.
+        - 'tableau_agent': Ask about dashboards or visual workspaces.
+        
+        Query: "{latest_message}"
+        Return ONLY the classification label.
+        """
+        response = model_flash.invoke(route_prompt)
+        target = response.content.strip().lower()
+        if target not in ["metadata_qa", "sql_subgraph", "tableau_agent"]:
+            target = "metadata_qa"
+            
+        return {"current_agent": target, "resolved_query": latest_message}
+        
+    # Heuristic 2: Heuristically check if it's a follow-up
+    context_indicators = {
+        "it", "they", "them", "those", "that", "this", "these", "here", 
+        "there", "then", "also", "and", "but", "or", "yesterday", 
+        "previous", "above", "instead", "another", "same"
+    }
+    query_words = set(latest_message.lower().split())
+    is_followup = not query_words.isdisjoint(context_indicators) or len(query_words) < 4
+
+    if not is_followup:
+        # Bypass rephrasing: just classify target agent
+        route_prompt = f"""
+        Classify the intent of this query for an Enterprise Data Warehouse:
+        - 'metadata_qa': Define concepts, locate tables/columns, explain database relationships or schemas.
+        - 'sql_subgraph': Generate a SQL query, calculate metrics/KPIs, or update a query.
+        - 'tableau_agent': Ask about dashboards or visual workspaces.
+        
+        Query: "{latest_message}"
+        Return ONLY the classification label.
+        """
+        response = model_flash.invoke(route_prompt)
+        target = response.content.strip().lower()
+        if target not in ["metadata_qa", "sql_subgraph", "tableau_agent"]:
+            target = "metadata_qa"
+            
+        return {"current_agent": target, "resolved_query": latest_message}
+
+    # If it is a follow-up, perform unified classification and condensation
     prompt = f"""
-    You are an orchestrator routing queries for an Enterprise Data Warehouse chatbot.
-    Analyze the recent dialogue and classify the intent:
-    - 'metadata_qa': If asking to define concepts, locate tables/columns, explain database relationships or schemas.
-    - 'sql_subgraph': If asking to generate a query, calculate KPIs, or update/filter an existing query.
-    - 'tableau_agent': If asking about dashboards, visual connections, or Tableau workspaces.
+    You are an orchestrator and query condenser for an Enterprise Data Warehouse chatbot.
+    Analyze the conversation history and the latest message:
     
-    Recent Dialogue: {recent_messages}
-    Return ONLY one key: metadata_qa, sql_subgraph, or tableau_agent.
+    Conversation History:
+    {messages[:-1]}
+    
+    Latest Message: "{latest_message}"
+    
+    Tasks:
+    1. Classify the intent into one of these agents:
+       - 'metadata_qa': Define concepts, locate tables/columns, explain schemas/relationships.
+       - 'sql_subgraph': Generate a SQL query, calculate metrics/KPIs, or update a query.
+       - 'tableau_agent': Ask about dashboards or visual workspaces.
+    2. Generate a standalone, search-friendly version of the latest query (resolving pronouns/context).
+    
+    Return your response strictly as a JSON object with these keys:
+    {{
+      "target_agent": "metadata_qa" | "sql_subgraph" | "tableau_agent",
+      "resolved_query": "standalone rephrased query string"
+    }}
     """
     response = model_flash.invoke(prompt)
-    target = response.content.strip().lower()
-    
+    try:
+        data = json.loads(response.content.strip())
+        target = data.get("target_agent", "metadata_qa")
+        resolved = data.get("resolved_query", latest_message)
+    except Exception:
+        target = "metadata_qa"
+        resolved = latest_message
+        
     if target not in ["metadata_qa", "sql_subgraph", "tableau_agent"]:
         target = "metadata_qa"
         
-    return {"current_agent": target}
+    return {"current_agent": target, "resolved_query": resolved}
 
 def call_sql_subgraph(state: MainState) -> Dict:
     """
     Bridge node: Isolates context, triggers sub-graph execution, maps final SQL back.
+    Uses the pre-condensed 'resolved_query' in the sub-graph history context.
     """
-    recent_history = state["messages"][-4:] # Trim memory for SQL generation
-    
     sub_input = {
-        "chat_history": recent_history,
+        "chat_history": [HumanMessage(content=state.get("resolved_query", ""))],
         "base_sql": state.get("final_sql", ""),
         "validation_count": 0,
         "errors": []
@@ -314,32 +420,12 @@ def call_sql_subgraph(state: MainState) -> Dict:
 
 def metadata_qa_agent(state: MainState) -> Dict:
     """
-    Metadata Q&A Node: Resolves pronoun references first, retrieves dynamic few-shot 
-    Q&A exemplars from liked responses, queries vector catalog, and generates answer.
+    Metadata Q&A Node: Uses the pre-condensed 'resolved_query' from the supervisor,
+    retrieves dynamic few-shot exemplars, queries vector catalog, and generates answer.
     """
-    recent_history = state["messages"][-4:]
-    latest_message = recent_history[-1].content
+    search_query = state.get("resolved_query", state["messages"][-1].content)
     
-    # 1. Query Condensation (Pronoun Resolution for Q&A Follow-ups)
-    if len(recent_history) > 1:
-        rephrase_prompt = f"""
-        Given the following conversation history and a follow-up query, 
-        rephrase the follow-up query to be a standalone, search-friendly question.
-        Do not answer it, just rephrase it.
-        
-        Chat History:
-        {recent_history[:-1]}
-        
-        Follow-up Query: "{latest_message}"
-        
-        Standalone Rephrased Query:
-        """
-        search_query = model_flash.invoke(rephrase_prompt).content.strip()
-    else:
-        search_query = latest_message
-        
-    # 2. Retrieve Dynamic Few-Shot Exemplars (QA Feedback Store)
-    # Search our Vector DB of historically "Liked" Q&A answers:
+    # 1. Retrieve Dynamic Few-Shot Exemplars (QA Feedback Store)
     # qa_exemplars = verified_qa_vector_store.similarity_search(search_query, k=1)
     mock_qa_exemplar = (
         "Example of a highly-rated answer for a similar question:\n"
@@ -348,11 +434,11 @@ def metadata_qa_agent(state: MainState) -> Dict:
         "under the column `signup_date` (DATETIME). This table is refreshed daily.'\n"
     )
         
-    # 3. Retrieve metadata information (Mock RAG retrieval)
+    # 2. Retrieve metadata information (Mock RAG retrieval)
     # retrieved_metadata = metadata_catalog.search(search_query)
     retrieved_metadata = "Table 'dim_customers' has columns: customer_id, name, signup_date."
     
-    # 4. Formulate Answer using both retrieved docs AND the dynamic exemplar
+    # 3. Formulate Answer using both retrieved docs AND the dynamic exemplar
     answer_prompt = f"""
     You are an EDW Metadata Assistant. Answer the user's latest question using the retrieved metadata schemas.
     Use the provided example answer as a reference for tone, formatting, and level of detail.
@@ -363,10 +449,7 @@ def metadata_qa_agent(state: MainState) -> Dict:
     Retrieved Schemas:
     {retrieved_metadata}
     
-    Conversation Context:
-    {recent_history[:-1]}
-    
-    Latest Question: "{latest_message}"
+    Question: "{search_query}"
     """
     response = model_pro.invoke(answer_prompt)
     
@@ -382,17 +465,26 @@ def response_formatter(state: MainState) -> Dict:
 
 
 # ==========================================
-# 6. MAIN GRAPH COMPOSITION & PERSISTENCE
+# 7. MAIN GRAPH COMPOSITION & PERSISTENCE
 # ==========================================
 main_workflow = StateGraph(MainState)
 
+main_workflow.add_node("cache_lookup", semantic_cache_lookup)
 main_workflow.add_node("supervisor", supervisor_router)
 main_workflow.add_node("metadata_qa", metadata_qa_agent)
 main_workflow.add_node("sql_subgraph", call_sql_subgraph)
 main_workflow.add_node("tableau_agent", tableau_agent)
 main_workflow.add_node("formatter", response_formatter)
 
-main_workflow.add_edge(START, "supervisor")
+# Tier 1: Cache check runs first
+main_workflow.add_edge(START, "cache_lookup")
+main_workflow.add_conditional_edges(
+    "cache_lookup",
+    route_cache_result,
+    {"supervisor": "supervisor", "formatter": "formatter"}
+)
+
+# Supervisor routes to the appropriate agent
 main_workflow.add_conditional_edges(
     "supervisor",
     lambda state: state["current_agent"],
@@ -412,7 +504,7 @@ app = main_workflow.compile(checkpointer=checkpointer)
 
 
 # ==========================================
-# 7. UTILS
+# 8. UTILS
 # ==========================================
 def extract_sql_from_markdown(text: str) -> str:
     if "```sql" in text:
